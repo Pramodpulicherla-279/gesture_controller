@@ -2,8 +2,12 @@ import pygetwindow as gw
 import time
 import win32gui
 import win32con
+import win32ui
+import win32api
+import win32process
 import pywintypes
 import ctypes
+import numpy as np
 
 # Constants for Windows API
 SW_RESTORE = 9
@@ -17,6 +21,8 @@ class WindowController:
         self.refresh_cooldown = 2.0
         self.last_activation_time = 0
         self.activation_cooldown = 0.3  # seconds
+        self._icon_cache = {}
+        self._window_order = []  # persisted hwnd order, independent of Z-order
         self.refresh_windows()
 
     def _bring_to_foreground(self, hwnd):
@@ -40,14 +46,20 @@ class WindowController:
             print(f"Foreground error: {e}")
 
     def refresh_windows(self):
-        """Get visible windows sorted by Z-order"""
+        """Get visible windows, keeping their list order stable across refreshes.
+
+        Order is NOT re-derived from Z-order each time -- activating a window
+        changes its Z-order, which previously reshuffled the whole preview
+        list on the very next refresh. Instead, existing windows keep their
+        position; only newly-opened windows get appended and closed ones
+        removed.
+        """
         if time.time() - self.last_refresh < self.refresh_cooldown:
             return
-            
+
         try:
-            self.windows = []
             temp_windows = []
-            
+
             def enum_handler(hwnd, _):
                 if win32gui.IsWindowVisible(hwnd) and win32gui.GetWindowText(hwnd):
                     title = win32gui.GetWindowText(hwnd)
@@ -61,29 +73,41 @@ class WindowController:
                     except:
                         pass
                 return True
-                
+
             win32gui.EnumWindows(enum_handler, None)
-            
-            # Sort by Z-order
-            sorted_windows = []
-            hwnd = win32gui.GetTopWindow(None)
-            while hwnd:
-                for win in temp_windows:
-                    if win[0] == hwnd:
-                        sorted_windows.append(win)
-                        break
-                hwnd = win32gui.GetWindow(hwnd, win32con.GW_HWNDNEXT)
-            
-            # Convert to pygetwindow objects
+            current_by_hwnd = dict(temp_windows)
+
+            # Keep known windows in their existing order (refreshing their
+            # title in case it changed), then append any newly-seen windows.
+            ordered = [(hwnd, current_by_hwnd[hwnd]) for hwnd, _ in self._window_order
+                       if hwnd in current_by_hwnd]
+            known_hwnds = {hwnd for hwnd, _ in ordered}
+            for hwnd, title in temp_windows:
+                if hwnd not in known_hwnds:
+                    ordered.append((hwnd, title))
+                    known_hwnds.add(hwnd)
+
+            self._window_order = ordered
+
+            # Convert to pygetwindow objects, preserving the order above and
+            # leaving out whichever window is currently focused -- no point
+            # offering to "switch to" the app you're already on. It keeps its
+            # slot in self._window_order so it reappears in the same spot
+            # once it's no longer the active window, instead of moving to
+            # the end of the list.
+            foreground_hwnd = win32gui.GetForegroundWindow()
             all_windows = gw.getAllWindows()
-            for hwnd, title in sorted_windows:
+            self.windows = []
+            for hwnd, title in ordered:
+                if hwnd == foreground_hwnd:
+                    continue
                 for win in all_windows:
                     if hasattr(win, '_hWnd') and win._hWnd == hwnd and win.title == title:
                         self.windows.append(win)
                         break
-            
+
             self.last_refresh = time.time()
-            
+
         except Exception as e:
             print(f"Refresh error: {e}")
 
@@ -91,6 +115,87 @@ class WindowController:
         """Return list of available windows"""
         self.refresh_windows()
         return self.windows
+
+    def get_icon(self, hwnd, size=32):
+        """Return the window's app icon as a (size, size, 4) BGRA numpy array, or None."""
+        if hwnd in self._icon_cache:
+            return self._icon_cache[hwnd]
+
+        icon_img = None
+        try:
+            hicon = self._get_window_hicon(hwnd) or self._get_exe_hicon(hwnd)
+            if hicon:
+                icon_img = self._hicon_to_bgra(hicon, size)
+                win32gui.DestroyIcon(hicon)
+        except Exception as e:
+            print(f"Icon extraction failed: {e}")
+
+        self._icon_cache[hwnd] = icon_img
+        return icon_img
+
+    ICON_SMALL2 = 2  # not exposed by win32con; see WM_GETICON docs
+
+    @staticmethod
+    def _get_window_hicon(hwnd):
+        """Ask the window itself for its icon (accurate for well-behaved apps)."""
+        for icon_type in (win32con.ICON_BIG, WindowController.ICON_SMALL2, win32con.ICON_SMALL):
+            try:
+                _, hicon = win32gui.SendMessageTimeout(
+                    hwnd, win32con.WM_GETICON, icon_type, 0, win32con.SMTO_ABORTIFHUNG, 100)
+                if hicon:
+                    return hicon
+            except Exception:
+                pass
+        try:
+            hicon = win32gui.GetClassLong(hwnd, win32con.GCL_HICON)
+            if hicon:
+                return hicon
+        except Exception:
+            pass
+        return 0
+
+    @staticmethod
+    def _get_exe_hicon(hwnd):
+        """Fall back to the icon embedded in the owning process's executable."""
+        try:
+            _, pid = win32process.GetWindowThreadProcessId(hwnd)
+            hprocess = win32api.OpenProcess(
+                win32con.PROCESS_QUERY_INFORMATION | win32con.PROCESS_VM_READ, False, pid)
+            exe_path = win32process.GetModuleFileNameEx(hprocess, 0)
+            large, small = win32gui.ExtractIconEx(exe_path, 0)
+            for h in small:
+                win32gui.DestroyIcon(h)
+            if large:
+                hicon = large[0]
+                for h in large[1:]:
+                    win32gui.DestroyIcon(h)
+                return hicon
+        except Exception:
+            pass
+        return 0
+
+    @staticmethod
+    def _hicon_to_bgra(hicon, size):
+        """Render an HICON into an off-screen bitmap and return it as a BGRA numpy array."""
+        hdc_screen = win32gui.GetDC(0)
+        hdc = win32ui.CreateDCFromHandle(hdc_screen)
+        hdc_mem = hdc.CreateCompatibleDC()
+        hbmp = win32ui.CreateBitmap()
+        hbmp.CreateCompatibleBitmap(hdc, size, size)
+        hdc_mem.SelectObject(hbmp)
+        hdc_mem.DrawIcon((0, 0), hicon)
+
+        bmpinfo = hbmp.GetInfo()
+        bmpstr = hbmp.GetBitmapBits(True)
+        img = np.frombuffer(bmpstr, dtype=np.uint8).reshape(
+            (bmpinfo['bmHeight'], bmpinfo['bmWidth'], 4)).copy()
+
+        win32gui.DeleteObject(hbmp.GetHandle())
+        hdc_mem.DeleteDC()
+        hdc.DeleteDC()
+        win32gui.ReleaseDC(0, hdc_screen)
+
+        return img
 
     def activate_window(self, index):
         """Activate specific window by index with guaranteed foreground focus"""

@@ -19,11 +19,33 @@ def calculate_distance(point1, point2):
     """Calculate Euclidean distance between two points"""
     return np.sqrt((point1[0]-point2[0])**2 + (point1[1]-point2[1])**2)
 
+def blit_icon(frame, icon_bgra, pos):
+    """Alpha-blend a BGRA icon onto frame at pos=(x, y)"""
+    if icon_bgra is None:
+        return
+    x, y = pos
+    h, w = icon_bgra.shape[:2]
+    if x < 0 or y < 0 or x + w > frame.shape[1] or y + h > frame.shape[0]:
+        return
+
+    roi = frame[y:y+h, x:x+w].astype(np.float32)
+    icon_bgr = icon_bgra[:, :, :3].astype(np.float32)
+    alpha = (icon_bgra[:, :, 3:4].astype(np.float32)) / 255.0
+
+    frame[y:y+h, x:x+w] = (icon_bgr * alpha + roi * (1 - alpha)).astype(np.uint8)
+
 def set_window_transparency(hwnd, opacity):
-    """Set window transparency (0-255)"""
+    """Set window transparency (0-255) and make it click-through.
+
+    WS_EX_TRANSPARENT lets mouse clicks/scrolls pass straight through to
+    whatever is underneath, so the fullscreen overlay doesn't block you from
+    working in other windows/tabs -- it's purely a visual layer on top.
+    """
     try:
+        WS_EX_LAYERED = 0x80000
+        WS_EX_TRANSPARENT = 0x20
         ex_style = ctypes.windll.user32.GetWindowLongA(hwnd, -20)
-        ctypes.windll.user32.SetWindowLongA(hwnd, -20, ex_style | 0x80000)
+        ctypes.windll.user32.SetWindowLongA(hwnd, -20, ex_style | WS_EX_LAYERED | WS_EX_TRANSPARENT)
         ctypes.windll.user32.SetLayeredWindowAttributes(hwnd, 0, opacity, 0x2)
     except Exception as e:
         print(f"Couldn't set transparency: {e}")
@@ -143,6 +165,7 @@ def main():
     volume_bar_rect = (20, 20, 600, 30)
     last_click_time = 0
     click_cooldown = 0.5  # seconds
+    window_hover_active = False  # True while the finger is continuously over a preview
     
     # Cache for window previews
     preview_cache = []
@@ -197,35 +220,58 @@ def main():
             preview_width = 120
             preview_height = 80
             margin = 10
-            
-            for i, win in enumerate(preview_cache):
+
+            def preview_rect(idx):
                 x = DISPLAY_WIDTH - preview_width - margin
-                y = margin + i * (preview_height + margin)
-                
+                y = margin + idx * (preview_height + margin)
+                return x, y
+
+            # Find which preview (if any) the finger is over. Done once, up
+            # front, against the list as it stood for this frame -- the
+            # activation decision below never re-checks this after the list
+            # may have re-sorted, which is what was causing the cascade.
+            hovered_index = None
+            if index_tip:
+                for i in range(len(preview_cache)):
+                    x, y = preview_rect(i)
+                    if x <= index_tip[0] <= x+preview_width and y <= index_tip[1] <= y+preview_height:
+                        hovered_index = i
+                        break
+
+            for i, win in enumerate(preview_cache):
+                x, y = preview_rect(i)
+
                 # Draw preview background
-                cv2.rectangle(display_frame, (x, y), (x+preview_width, y+preview_height), 
+                cv2.rectangle(display_frame, (x, y), (x+preview_width, y+preview_height),
                              (50, 50, 50), -1)
-                cv2.rectangle(display_frame, (x, y), (x+preview_width, y+preview_height), 
-                             (255, 255, 255), 1)
-                
+
+                # App icon thumbnail
+                icon_size = 32
+                icon = window_controller.get_icon(win._hWnd, icon_size)
+                icon_pos = (x + (preview_width - icon_size) // 2, y + 6)
+                blit_icon(display_frame, icon, icon_pos)
+
+                border_color = (0, 255, 0) if i == hovered_index else (255, 255, 255)
+                cv2.rectangle(display_frame, (x, y), (x+preview_width, y+preview_height),
+                             border_color, 2 if i == hovered_index else 1)
+
                 # Display window title
                 title = win.title[:15] + "..." if len(win.title) > 15 else win.title
-                cv2.putText(display_frame, title, (x+5, y+15), 
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
-                
-                # Check if clicked (index finger in preview area)
-                if (index_tip and 
-                    x <= index_tip[0] <= x+preview_width and 
-                    y <= index_tip[1] <= y+preview_height):
-                    
-                    cv2.rectangle(display_frame, (x, y), (x+preview_width, y+preview_height), 
-                                 (0, 255, 0), 2)
-                    
-                    # Only activate if we're not dragging and cooldown has passed
-                    if (not is_dragging and 
-                        current_time - last_click_time > click_cooldown):
-                        window_controller.activate_window(i)
-                        last_click_time = current_time
+                cv2.putText(display_frame, title, (x+5, y+preview_height-8),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.35, (255, 255, 255), 1)
+
+            # Activate only on a *fresh* hover -- the finger has to leave the
+            # preview area and come back before another switch can fire.
+            # This is what stops the list re-sorting (every cache_cooldown,
+            # once a window is activated it jumps to the front of the
+            # Z-order) from immediately triggering another switch on
+            # whatever window ends up back under a finger that never moved.
+            if (hovered_index is not None and not window_hover_active and
+                    not is_dragging and current_time - last_click_time > click_cooldown):
+                window_controller.activate_window(hovered_index)
+                last_click_time = current_time
+
+            window_hover_active = hovered_index is not None
 
             # Volume control
             bar_x, bar_y, bar_w, bar_h = volume_bar_rect
