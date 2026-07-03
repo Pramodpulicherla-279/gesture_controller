@@ -1,0 +1,592 @@
+main.py
+import cv2
+import argparse
+import threading
+import numpy as np
+from core.gesture_controller import GestureController
+from core.volume_controller import VolumeController
+from utils.system_tray import create_system_tray
+from utils.helpers import load_config
+import time
+
+def main():
+    # Parse command line arguments
+    parser = argparse.ArgumentParser(description='Gesture Volume Control')
+    parser.add_argument('--calibrate', action='store_true',
+                       help='Enter calibration mode')
+    args = parser.parse_args()
+
+    # Load configuration
+    config = load_config('config/default_config.yaml')
+
+    if args.calibrate:
+        from utils.helpers import calibration_mode
+        calibration_mode()
+        return
+
+    # Initialize controllers
+    gesture_controller = GestureController(config)
+    volume_controller = VolumeController()
+
+    # Start system tray icon in separate thread
+    tray_thread = threading.Thread(target=create_system_tray, daemon=True)
+    tray_thread.start()
+
+    # Main processing loop
+    cap = cv2.VideoCapture(0)
+    
+    if not cap.isOpened():
+        print("Error: Could not open video capture device")
+        return
+    
+    # Set reasonable default resolution
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 840)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 680)
+
+    # Volume control state
+    volume_level = volume_controller.get_volume()
+    is_dragging = False
+    volume_bar_rect = (20, 20, 600, 30)  # x, y, width, height
+
+    while cap.isOpened():
+        ret, frame = cap.read()
+        if not ret:
+            print("Warning: Could not read frame from camera")
+            break
+
+        frame = cv2.flip(frame, 1)
+        
+        try:
+            # Process gestures on the raw frame
+            results = gesture_controller.process_frame(frame)
+            index_tip = None
+            
+            if results and results.multi_hand_landmarks:
+                for hand_landmarks in results.multi_hand_landmarks:
+                    gesture_controller.draw_landmarks(frame, hand_landmarks)
+                    
+                    # Get index finger tip position
+                    landmarks = hand_landmarks.landmark
+                    h, w, _ = frame.shape
+                    index_tip = (int(landmarks[8].x * w), int(landmarks[8].y * h))
+            
+            # Draw volume bar
+            bar_x, bar_y, bar_w, bar_h = volume_bar_rect
+            
+            # Volume bar background
+            cv2.rectangle(frame, (bar_x, bar_y), (bar_x + bar_w, bar_y + bar_h), 
+                         (50, 50, 50), -1)
+            
+            # Volume level fill
+            filled_width = int((volume_level / 100) * bar_w)
+            cv2.rectangle(frame, (bar_x, bar_y), (bar_x + filled_width, bar_y + bar_h), 
+                         (0, 200, 0), -1)
+            
+            # Volume bar border
+            cv2.rectangle(frame, (bar_x, bar_y), (bar_x + bar_w, bar_y + bar_h), 
+                         (255, 255, 255), 2)
+            
+            # Volume knob
+            knob_x = bar_x + filled_width
+            cv2.circle(frame, (knob_x, bar_y + bar_h//2), 15, (0, 0, 255), -1)
+            
+            # Volume percentage text
+            cv2.putText(frame, f"{volume_level}%", (bar_x + bar_w + 10, bar_y + bar_h), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+            
+            # Handle volume dragging
+            if index_tip:
+                # Check if finger is on the volume knob
+                if (abs(index_tip[0] - knob_x) < 30 and 
+                    abs(index_tip[1] - (bar_y + bar_h//2)) < 30):
+                    is_dragging = True
+                
+                # Update volume while dragging
+                if is_dragging:
+                    relative_pos = (index_tip[0] - bar_x) / bar_w
+                    new_volume = int(relative_pos * 100)
+                    new_volume = max(0, min(100, new_volume))
+                    
+                    if new_volume != volume_level:
+                        volume_controller.set_volume(new_volume)
+                        volume_level = new_volume
+            
+            # Stop dragging when finger is released
+            if not index_tip and is_dragging:
+                is_dragging = False
+            
+            # Display instructions
+            cv2.putText(frame, "Drag the red knob with your index finger", (20, frame.shape[0] - 20),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
+            
+            cv2.imshow('Gesture Volume Control', frame)
+            
+        except Exception as e:
+            print(f"Error processing frame: {e}")
+            cv2.imshow('Gesture Volume Control', frame)
+
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            break
+
+    cap.release()
+    cv2.destroyAllWindows()
+
+if __name__ == "__main__":
+    main()
+
+-----------------------------------------------------
+gesture_controller.py
+
+import mediapipe as mp
+import cv2
+
+class GestureController:
+    def __init__(self, config):
+        self.mp_hands = mp.solutions.hands
+        self.hands = self.mp_hands.Hands(
+            max_num_hands=1,  # Only need one hand for dragging
+            min_detection_confidence=0.7,
+            min_tracking_confidence=0.7
+        )
+        self.mp_draw = mp.solutions.drawing_utils
+
+    def process_frame(self, frame):
+        if frame is None or frame.size == 0:
+            return None
+            
+        try:
+            rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            return self.hands.process(rgb_frame)
+        except Exception as e:
+            print(f"Error in gesture processing: {e}")
+            return None
+
+    def draw_landmarks(self, frame, hand_landmarks):
+        try:
+            self.mp_draw.draw_landmarks(
+                frame, hand_landmarks, self.mp_hands.HAND_CONNECTIONS,
+                landmark_drawing_spec=self.mp_draw.DrawingSpec(
+                    color=(0, 255, 0), thickness=2, circle_radius=3),
+                connection_drawing_spec=self.mp_draw.DrawingSpec(
+                    color=(0, 255, 0), thickness=2)
+            )
+            
+            # Highlight index finger
+            landmarks = hand_landmarks.landmark
+            h, w, _ = frame.shape
+            index_tip = (int(landmarks[8].x * w), int(landmarks[8].y * h))
+            cv2.circle(frame, index_tip, 15, (0, 255, 255), -1)
+            
+        except Exception as e:
+            print(f"Error drawing landmarks: {e}")
+
+--------------------------------------
+
+volume_controller.py
+
+from pycaw.pycaw import AudioUtilities, IAudioEndpointVolume
+from ctypes import cast, POINTER
+from comtypes import CLSCTX_ALL
+import time
+
+class VolumeController:
+    def __init__(self):
+        devices = AudioUtilities.GetSpeakers()
+        interface = devices.Activate(
+            IAudioEndpointVolume._iid_, CLSCTX_ALL, None)
+        self.volume = cast(interface, POINTER(IAudioEndpointVolume))
+        self.vol_range = self.volume.GetVolumeRange()
+        self.min_vol, self.max_vol = self.vol_range[0], self.vol_range[1]
+        self.last_volume = self.get_volume()
+        self.last_update_time = time.time()
+
+    def set_volume(self, level):
+        """Set volume level (0-100) with immediate feedback"""
+        vol = self.min_vol + (self.max_vol - self.min_vol) * (level / 100)
+        self.volume.SetMasterVolumeLevel(vol, None)
+        self.last_volume = level
+        self.last_update_time = time.time()
+
+    def get_volume(self):
+        """Get current volume level (0-100) with rounding to nearest integer"""
+        vol_scalar = self.volume.GetMasterVolumeLevelScalar()
+        return int(round(vol_scalar * 100))  # Rounded to nearest percent
+
+    def is_volume_changed_externally(self):
+        """Check if volume was changed outside our application"""
+        current_vol = self.get_volume()
+        if current_vol != self.last_volume:
+            self.last_volume = current_vol
+            return True
+        return False
+-----------------
+main.py 2nd
+
+import cv2
+import argparse
+import threading
+import numpy as np
+import time
+import ctypes
+from ctypes import wintypes
+import win32gui
+import win32con
+from core.gesture_controller import GestureController
+from core.volume_controller import VolumeController
+from core.window_controller import WindowController
+from utils.system_tray import create_system_tray
+from utils.helpers import load_config
+
+# Constants for display dimensions
+DISPLAY_WIDTH = 840
+DISPLAY_HEIGHT = 680
+
+def calculate_distance(point1, point2):
+    """Calculate Euclidean distance between two points"""
+    return np.sqrt((point1[0]-point2[0])**2 + (point1[1]-point2[1])**2)
+
+def set_window_transparency(hwnd, opacity):
+    """Set window transparency (0-255)"""
+    try:
+        ex_style = ctypes.windll.user32.GetWindowLongA(hwnd, -20)
+        ctypes.windll.user32.SetWindowLongA(hwnd, -20, ex_style | 0x80000)
+        ctypes.windll.user32.SetLayeredWindowAttributes(hwnd, 0, opacity, 0x2)
+    except Exception as e:
+        print(f"Couldn't set transparency: {e}")
+
+def draw_hand_landmarks_schematic(image_shape, landmarks, color=(0, 255, 0)):
+    """Draw schematic hand landmarks on black background"""
+    schematic = np.zeros((image_shape[0], image_shape[1], 3), dtype=np.uint8)
+    
+    if landmarks is None:
+        return schematic
+    
+    # Draw connections between landmarks
+    connections = [
+        (0, 1), (1, 2), (2, 3), (3, 4),  # Thumb
+        (0, 5), (5, 6), (6, 7), (7, 8),  # Index
+        (0, 9), (9, 10), (10, 11), (11, 12),  # Middle
+        (0, 13), (13, 14), (14, 15), (15, 16),  # Ring
+        (0, 17), (17, 18), (18, 19), (19, 20)  # Pinky
+    ]
+    
+    for connection in connections:
+        start = landmarks.landmark[connection[0]]
+        end = landmarks.landmark[connection[1]]
+        start_pos = (int(start.x * image_shape[1]), int(start.y * image_shape[0]))
+        end_pos = (int(end.x * image_shape[1]), int(end.y * image_shape[0]))
+        cv2.line(schematic, start_pos, end_pos, color, 2)
+    
+    # Draw landmarks as circles
+    for landmark in landmarks.landmark:
+        pos = (int(landmark.x * image_shape[1]), int(landmark.y * image_shape[0]))
+        cv2.circle(schematic, pos, 5, color, -1)
+    
+    return schematic
+
+def main():
+    # Parse command line arguments
+    parser = argparse.ArgumentParser(description='Gesture Control System')
+    parser.add_argument('--calibrate', action='store_true',
+                       help='Enter calibration mode')
+    args = parser.parse_args()
+
+    # Load configuration
+    config = load_config('config/default_config.yaml')
+
+    if args.calibrate:
+        from utils.helpers import calibration_mode
+        calibration_mode()
+        return
+
+    # Initialize controllers
+    gesture_controller = GestureController(config)
+    volume_controller = VolumeController()
+    window_controller = WindowController()
+
+    # Start system tray icon
+    tray_thread = threading.Thread(target=create_system_tray, daemon=True)
+    tray_thread.start()
+
+    # Main processing loop
+    cap = cv2.VideoCapture(0)
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, DISPLAY_WIDTH)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, DISPLAY_HEIGHT)
+
+    # Create named window in fullscreen mode
+    cv2.namedWindow('Gesture Control System', cv2.WINDOW_NORMAL)
+    cv2.setWindowProperty('Gesture Control System', cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
+    
+    # Set window to stay on top
+    cv2.setWindowProperty('Gesture Control System', cv2.WND_PROP_TOPMOST, 1)
+    
+    # Set window transparency to 20%
+    opacity_percent = 20
+    hwnd = win32gui.FindWindow(None, 'Gesture Control System')
+    set_window_transparency(hwnd, int(255 * opacity_percent / 100))
+
+    # Control states
+    volume_level = volume_controller.get_volume()
+    is_dragging = False
+    volume_bar_rect = (20, 20, 600, 30)
+    last_click_time = 0
+    click_cooldown = 0.5  # seconds
+    
+    # Cache for window previews
+    preview_cache = []
+    last_cache_update = 0
+    cache_cooldown = 2.0  # seconds
+
+    while cap.isOpened():
+        ret, frame = cap.read()
+        if not ret:
+            break
+
+        # Create a black background with consistent dimensions
+        display_frame = np.zeros((DISPLAY_HEIGHT, DISPLAY_WIDTH, 3), dtype=np.uint8)
+        current_time = time.time()
+        
+        try:
+            # Process the original frame (not flipped)
+            results = gesture_controller.process_frame(frame)
+            index_tip = None
+            thumb_tip = None
+            
+            if results and results.multi_hand_landmarks:
+                for hand_landmarks in results.multi_hand_landmarks:
+                    # Draw schematic hand landmarks
+                    hand_schematic = draw_hand_landmarks_schematic((DISPLAY_HEIGHT, DISPLAY_WIDTH), hand_landmarks)
+                    
+                    # Flip the hand schematic horizontally to match mirror-like movement
+                    hand_schematic = cv2.flip(hand_schematic, 1)
+                    
+                    # Add the hand schematic to our display frame
+                    display_frame = cv2.add(display_frame, hand_schematic)
+                    
+                    landmarks = hand_landmarks.landmark
+                    
+                    # Get finger positions (using display dimensions)
+                    # Flip the x-coordinate to match the display
+                    index_tip = (DISPLAY_WIDTH - int(landmarks[8].x * DISPLAY_WIDTH), 
+                                int(landmarks[8].y * DISPLAY_HEIGHT))
+                    thumb_tip = (DISPLAY_WIDTH - int(landmarks[4].x * DISPLAY_WIDTH), 
+                                int(landmarks[4].y * DISPLAY_HEIGHT))
+                    
+                    # Visual connection between index and thumb
+                    cv2.line(display_frame, index_tip, thumb_tip, (255, 0, 0), 2)
+
+            # Update preview cache if needed
+            if current_time - last_cache_update > cache_cooldown:
+                preview_cache = window_controller.get_windows()
+                last_cache_update = current_time
+
+            # Display cached window previews
+            preview_width = 120
+            preview_height = 80
+            margin = 10
+            
+            for i, win in enumerate(preview_cache):
+                x = DISPLAY_WIDTH - preview_width - margin
+                y = margin + i * (preview_height + margin)
+                
+                # Draw preview background
+                cv2.rectangle(display_frame, (x, y), (x+preview_width, y+preview_height), 
+                             (50, 50, 50), -1)
+                cv2.rectangle(display_frame, (x, y), (x+preview_width, y+preview_height), 
+                             (255, 255, 255), 1)
+                
+                # Display window title
+                title = win.title[:15] + "..." if len(win.title) > 15 else win.title
+                cv2.putText(display_frame, title, (x+5, y+15), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
+                
+                # Check if clicked (index finger in preview area)
+                if (index_tip and 
+                    x <= index_tip[0] <= x+preview_width and 
+                    y <= index_tip[1] <= y+preview_height):
+                    
+                    cv2.rectangle(display_frame, (x, y), (x+preview_width, y+preview_height), 
+                                 (0, 255, 0), 2)
+                    
+                    # Only activate if we're not dragging and cooldown has passed
+                    if (not is_dragging and 
+                        current_time - last_click_time > click_cooldown):
+                        window_controller.activate_window(i)
+                        last_click_time = current_time
+
+            # Volume control
+            bar_x, bar_y, bar_w, bar_h = volume_bar_rect
+            cv2.rectangle(display_frame, (bar_x, bar_y), (bar_x+bar_w, bar_y+bar_h), (50,50,50), -1)
+            filled = int((volume_level/100)*bar_w)
+            cv2.rectangle(display_frame, (bar_x, bar_y), (bar_x+filled, bar_y+bar_h), (0,200,0), -1)
+            cv2.rectangle(display_frame, (bar_x, bar_y), (bar_x+bar_w, bar_y+bar_h), (255,255,255), 2)
+            knob_x = bar_x + filled
+            cv2.circle(display_frame, (knob_x, bar_y+bar_h//2), 15, (0,0,255), -1)
+            cv2.putText(display_frame, f"{volume_level}%", (bar_x+bar_w+10, bar_y+bar_h), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255,255,255), 2)
+
+            if index_tip:
+                if (abs(index_tip[0]-knob_x) < 30 and abs(index_tip[1]-(bar_y+bar_h//2)) < 30):
+                    is_dragging = True
+                
+                if is_dragging:
+                    vol = int(((index_tip[0]-bar_x)/bar_w)*100)
+                    vol = max(0, min(100, vol))
+                    if vol != volume_level:
+                        volume_controller.set_volume(vol)
+                        volume_level = vol
+
+            if not index_tip and is_dragging:
+                is_dragging = False
+
+            # Instructions
+            instructions = [
+                "Volume: Drag the red knob with index finger",
+                "Window Control:",
+                "  - Point at preview → Activate window",
+                "Press 'q' to quit"
+            ]
+            
+            for i, text in enumerate(instructions):
+                cv2.putText(display_frame, text, (20, DISPLAY_HEIGHT - 100 + i*20),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+            
+            cv2.imshow('Gesture Control System', display_frame)
+
+        except Exception as e:
+            print(f"Error: {e}")
+            cv2.imshow('Gesture Control System', display_frame)
+
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            break
+
+    cap.release()
+    cv2.destroyAllWindows()
+
+if __name__ == "__main__":
+    main()
+
+    -------------------------------
+window_controller.py
+
+import pygetwindow as gw
+import time
+import win32gui
+import win32con
+import pywintypes
+import ctypes
+
+# Constants for Windows API
+SW_RESTORE = 9
+SW_MAXIMIZE = 3
+SW_MINIMIZE = 6
+
+class WindowController:
+    def __init__(self):
+        self.windows = []
+        self.last_refresh = 0
+        self.refresh_cooldown = 2.0
+        self.last_activation_time = 0
+        self.activation_cooldown = 0.3  # seconds
+        self.refresh_windows()
+
+    def _bring_to_foreground(self, hwnd):
+        """Force a window to the foreground using multiple methods"""
+        try:
+            # Try the Alt-tab simulation method
+            ctypes.windll.user32.keybd_event(0x12, 0, 0, 0)  # Alt
+            ctypes.windll.user32.keybd_event(0x09, 0, 0, 0)  # Tab
+            ctypes.windll.user32.keybd_event(0x09, 0, 2, 0)  # Release Tab
+            ctypes.windll.user32.keybd_event(0x12, 0, 2, 0)  # Release Alt
+            
+            # Direct foreground approach
+            win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
+            win32gui.SetForegroundWindow(hwnd)
+            
+            # Additional method for stubborn windows
+            win32gui.ShowWindow(hwnd, win32con.SW_SHOW)
+            win32gui.BringWindowToTop(hwnd)
+            
+        except Exception as e:
+            print(f"Foreground error: {e}")
+
+    def refresh_windows(self):
+        """Get visible windows sorted by Z-order"""
+        if time.time() - self.last_refresh < self.refresh_cooldown:
+            return
+            
+        try:
+            self.windows = []
+            temp_windows = []
+            
+            def enum_handler(hwnd, _):
+                if win32gui.IsWindowVisible(hwnd) and win32gui.GetWindowText(hwnd):
+                    try:
+                        rect = win32gui.GetWindowRect(hwnd)
+                        if rect[2]-rect[0] > 100 and rect[3]-rect[1] > 100:  # Minimum size
+                            temp_windows.append((hwnd, win32gui.GetWindowText(hwnd)))
+                    except:
+                        pass
+                return True
+                
+            win32gui.EnumWindows(enum_handler, None)
+            
+            # Sort by Z-order
+            sorted_windows = []
+            hwnd = win32gui.GetTopWindow(None)
+            while hwnd:
+                for win in temp_windows:
+                    if win[0] == hwnd:
+                        sorted_windows.append(win)
+                        break
+                hwnd = win32gui.GetWindow(hwnd, win32con.GW_HWNDNEXT)
+            
+            # Convert to pygetwindow objects
+            all_windows = gw.getAllWindows()
+            for hwnd, title in sorted_windows:
+                for win in all_windows:
+                    if hasattr(win, '_hWnd') and win._hWnd == hwnd and win.title == title:
+                        self.windows.append(win)
+                        break
+            
+            self.last_refresh = time.time()
+            
+        except Exception as e:
+            print(f"Refresh error: {e}")
+
+    def get_windows(self):
+        """Return list of available windows"""
+        self.refresh_windows()
+        return self.windows
+
+    def activate_window(self, index):
+        """Activate specific window by index with guaranteed foreground focus"""
+        if time.time() - self.last_activation_time < self.activation_cooldown:
+            return
+            
+        if 0 <= index < len(self.windows):
+            try:
+                window = self.windows[index]
+                hwnd = window._hWnd
+                
+                # Get current window state
+                placement = win32gui.GetWindowPlacement(hwnd)
+                was_maximized = placement[1] == win32con.SW_SHOWMAXIMIZED
+                was_minimized = placement[1] == win32con.SW_SHOWMINIMIZED
+                
+                # Restore if minimized
+                if was_minimized:
+                    win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
+                
+                # Bring to foreground using multiple methods
+                self._bring_to_foreground(hwnd)
+                
+                # Restore original maximized state if needed
+                if was_maximized:
+                    win32gui.ShowWindow(hwnd, win32con.SW_MAXIMIZE)
+                
+                self.last_activation_time = time.time()
+                
+            except Exception as e:
+                print(f"Window activation failed: {e}")
+                self.refresh_windows()

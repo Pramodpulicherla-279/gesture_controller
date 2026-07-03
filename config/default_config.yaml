@@ -1,0 +1,13 @@
+max_hands: 1
+detection_confidence: 0.7
+tracking_confidence: 0.5
+landmark_color: [0, 255, 255]  # BGR
+connection_color: [255, 0, 255]  # BGR
+gesture_thresholds:
+  pinch: 0.05
+  fist: 0.03
+  open: 0.1
+volume:
+  min: 0
+  max: 100
+  step: 5
