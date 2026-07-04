@@ -5,9 +5,13 @@ import numpy as np
 import time
 import ctypes
 import win32gui
+import win32con
 from core.gesture_controller import GestureController
 from core.volume_controller import VolumeController
 from core.window_controller import WindowController
+from core.dock_manager import DockManager
+from core.mouse_controller import MouseController
+from core import ui_theme
 from utils.system_tray import create_system_tray
 from utils.helpers import load_config
 
@@ -15,108 +19,47 @@ from utils.helpers import load_config
 DISPLAY_WIDTH = 840
 DISPLAY_HEIGHT = 680
 
-def calculate_distance(point1, point2):
-    """Calculate Euclidean distance between two points"""
-    return np.sqrt((point1[0]-point2[0])**2 + (point1[1]-point2[1])**2)
-
-def blit_icon(frame, icon_bgra, pos):
-    """Alpha-blend a BGRA icon onto frame at pos=(x, y)"""
-    if icon_bgra is None:
-        return
-    x, y = pos
-    h, w = icon_bgra.shape[:2]
-    if x < 0 or y < 0 or x + w > frame.shape[1] or y + h > frame.shape[0]:
-        return
-
-    roi = frame[y:y+h, x:x+w].astype(np.float32)
-    icon_bgr = icon_bgra[:, :, :3].astype(np.float32)
-    alpha = (icon_bgra[:, :, 3:4].astype(np.float32)) / 255.0
-
-    frame[y:y+h, x:x+w] = (icon_bgr * alpha + roi * (1 - alpha)).astype(np.uint8)
 
 def set_window_transparency(hwnd, opacity):
-    """Set window transparency (0-255) and make it click-through.
+    """Make the overlay click-through and glass-like.
 
     WS_EX_TRANSPARENT lets mouse clicks/scrolls pass straight through to
     whatever is underneath, so the fullscreen overlay doesn't block you from
-    working in other windows/tabs -- it's purely a visual layer on top.
+    working in other windows/tabs. LWA_COLORKEY makes pure black fully
+    transparent -- only what the dock/panels actually draw shows up, at
+    `opacity`, instead of a flat dim wash over the whole screen.
     """
     try:
         WS_EX_LAYERED = 0x80000
         WS_EX_TRANSPARENT = 0x20
+        LWA_COLORKEY = 0x1
+        LWA_ALPHA = 0x2
         ex_style = ctypes.windll.user32.GetWindowLongA(hwnd, -20)
         ctypes.windll.user32.SetWindowLongA(hwnd, -20, ex_style | WS_EX_LAYERED | WS_EX_TRANSPARENT)
-        ctypes.windll.user32.SetLayeredWindowAttributes(hwnd, 0, opacity, 0x2)
+        ctypes.windll.user32.SetLayeredWindowAttributes(hwnd, 0x000000, opacity, LWA_COLORKEY | LWA_ALPHA)
     except Exception as e:
         print(f"Couldn't set transparency: {e}")
 
-def draw_hand_landmarks_3d(image_shape, landmarks, color=(0, 255, 0)):
-    """Draw 3D-like hand landmarks on black background"""
-    schematic = np.zeros((image_shape[0], image_shape[1], 3), dtype=np.uint8)
-    
-    if landmarks is None:
-        return schematic
-    
-    # Define connections between landmarks (finger bones)
-    connections = [
-        (0, 1), (1, 2), (2, 3), (3, 4),  # Thumb
-        (0, 5), (5, 6), (6, 7), (7, 8),  # Index
-        (0, 9), (9, 10), (10, 11), (11, 12),  # Middle
-        (0, 13), (13, 14), (14, 15), (15, 16),  # Ring
-        (0, 17), (17, 18), (18, 19), (19, 20)  # Pinky
-    ]
-    
-    # Define palm connections for more 3D feel
-    palm_connections = [
-        (0, 1), (0, 5), (0, 9), (0, 13), (0, 17),
-        (5, 9), (9, 13), (13, 17)
-    ]
-    
-    # Draw palm connections first (thicker lines)
-    for connection in palm_connections:
-        start = landmarks.landmark[connection[0]]
-        end = landmarks.landmark[connection[1]]
-        start_pos = (int(start.x * image_shape[1]), int(start.y * image_shape[0]))
-        end_pos = (int(end.x * image_shape[1]), int(end.y * image_shape[0]))
-        cv2.line(schematic, start_pos, end_pos, (color[0]//2, color[1]//2, color[2]//2), 3)
-    
-    # Draw finger connections with varying thickness for depth effect
-    for connection in connections:
-        start = landmarks.landmark[connection[0]]
-        end = landmarks.landmark[connection[1]]
-        start_pos = (int(start.x * image_shape[1]), int(start.y * image_shape[0]))
-        end_pos = (int(end.x * image_shape[1]), int(end.y * image_shape[0]))
-        
-        # Calculate z-depth based on landmark z coordinate (assuming z is normalized)
-        z_depth = (start.z + end.z) / 2
-        thickness = max(1, int(3 * (1 - z_depth * 2)))  # Adjust thickness based on depth
-        
-        cv2.line(schematic, start_pos, end_pos, color, thickness)
-    
-    # Draw landmarks with size based on depth
-    for i, landmark in enumerate(landmarks.landmark):
-        pos = (int(landmark.x * image_shape[1]), int(landmark.y * image_shape[0]))
-        radius = max(3, int(8 * (1 - landmark.z * 2)))  # Bigger for closer points
-        
-        # Use different colors for different parts of the hand
-        if i == 0:  # Wrist
-            landmark_color = (200, 200, 0)
-        elif i in [4, 8, 12, 16, 20]:  # Fingertips
-            landmark_color = (0, 200, 200)
-        elif i % 4 == 0:  # Finger bases
-            landmark_color = (200, 0, 200)
-        else:  # Other joints
-            landmark_color = color
-        
-        # Draw outer circle for 3D effect
-        cv2.circle(schematic, pos, radius + 2, (50, 50, 50), -1)
-        cv2.circle(schematic, pos, radius, landmark_color, -1)
-        
-        # Add highlight for 3D effect
-        highlight_pos = (pos[0] - radius//3, pos[1] - radius//3)
-        cv2.circle(schematic, highlight_pos, radius//3, (255, 255, 255), -1)
-    
-    return schematic
+
+def set_topmost(hwnd, topmost):
+    """Toggle whether the overlay stays above every other window.
+
+    A WS_EX_TOPMOST window keeps rendering above whatever you click into,
+    even though clicks pass through it (WS_EX_TRANSPARENT) -- in mouse mode
+    that meant the app you just clicked into could never actually become the
+    true foreground/top window, breaking activation and anything that
+    depends on real window focus. So: topmost only while the dock is
+    showing (it needs to render above everything); dropped to normal
+    z-order the rest of the time, when the real OS cursor (drawn by Windows
+    itself, unaffected by our own z-order) is the only visual feedback
+    needed anyway.
+    """
+    try:
+        flag = win32con.HWND_TOPMOST if topmost else win32con.HWND_NOTOPMOST
+        win32gui.SetWindowPos(hwnd, flag, 0, 0, 0, 0, win32con.SWP_NOMOVE | win32con.SWP_NOSIZE)
+    except Exception as e:
+        print(f"Couldn't set topmost state: {e}")
+
 
 def main():
     # Parse command line arguments
@@ -137,6 +80,8 @@ def main():
     gesture_controller = GestureController(config)
     volume_controller = VolumeController()
     window_controller = WindowController()
+    dock_manager = DockManager(DISPLAY_WIDTH, DISPLAY_HEIGHT, volume_controller, window_controller)
+    mouse_controller = MouseController()
 
     # Start system tray icon
     tray_thread = threading.Thread(target=create_system_tray, daemon=True)
@@ -150,27 +95,18 @@ def main():
     # Create named window in fullscreen mode
     cv2.namedWindow('Gesture Control System', cv2.WINDOW_NORMAL)
     cv2.setWindowProperty('Gesture Control System', cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
-    
-    # Set window to stay on top
-    cv2.setWindowProperty('Gesture Control System', cv2.WND_PROP_TOPMOST, 1)
-    
-    # Set window transparency to 20%
-    opacity_percent = 20
+
+    # Glass elements render at 90% opacity; pure-black areas are fully
+    # transparent (see set_window_transparency), so apps underneath stay crisp.
+    opacity_percent = 90
     hwnd = win32gui.FindWindow(None, 'Gesture Control System')
     set_window_transparency(hwnd, int(255 * opacity_percent / 100))
 
-    # Control states
-    volume_level = volume_controller.get_volume()
-    is_dragging = False
-    volume_bar_rect = (20, 20, 600, 30)
-    last_click_time = 0
-    click_cooldown = 0.5  # seconds
-    window_hover_active = False  # True while the finger is continuously over a preview
-    
-    # Cache for window previews
-    preview_cache = []
-    last_cache_update = 0
-    cache_cooldown = 2.0  # seconds
+    # Topmost state is toggled dynamically in the loop based on whether the
+    # dock is showing (see set_topmost). Starts non-topmost since the dock
+    # starts hidden.
+    is_topmost = False
+    set_topmost(hwnd, is_topmost)
 
     while cap.isOpened():
         ret, frame = cap.read()
@@ -179,145 +115,85 @@ def main():
 
         # Create a black background with consistent dimensions
         display_frame = np.zeros((DISPLAY_HEIGHT, DISPLAY_WIDTH, 3), dtype=np.uint8)
-        current_time = time.time()
-        
+
         try:
             # Process the original frame (not flipped)
             results = gesture_controller.process_frame(frame)
             index_tip = None
             thumb_tip = None
-            
+            palm_center = None
+            pinching = False
+            palm_open = False
+            right_click_pinch = False
+            scroll_pinch = False
+            norm_x = None
+            norm_y = None
+
             if results and results.multi_hand_landmarks:
                 for hand_landmarks in results.multi_hand_landmarks:
-                    # Draw 3D hand landmarks
-                    hand_3d = draw_hand_landmarks_3d((DISPLAY_HEIGHT, DISPLAY_WIDTH), hand_landmarks)
-                    
-                    # Flip the hand 3d horizontally to match mirror-like movement
-                    hand_3d = cv2.flip(hand_3d, 1)
-                    
-                    # Add the hand 3d to our display frame
-                    display_frame = cv2.add(display_frame, hand_3d)
-                    
+                    pinching = gesture_controller.is_pinching(hand_landmarks)
+                    palm_open = gesture_controller.is_palm_open(hand_landmarks)
+                    right_click_pinch = gesture_controller.is_right_click_pinch(hand_landmarks)
+                    scroll_pinch = gesture_controller.is_scroll_pinch(hand_landmarks)
+
                     landmarks = hand_landmarks.landmark
-                    
+
+                    # Mirrored, resolution-independent (0-1) fingertip position,
+                    # used to drive the real OS cursor regardless of camera resolution
+                    norm_x = 1.0 - landmarks[8].x
+                    norm_y = landmarks[8].y
+
                     # Get finger positions (using display dimensions)
-                    # Flip the x-coordinate to match the display
-                    index_tip = (DISPLAY_WIDTH - int(landmarks[8].x * DISPLAY_WIDTH), 
+                    # Flip the x-coordinate to match the display (mirror-like movement)
+                    index_tip = (DISPLAY_WIDTH - int(landmarks[8].x * DISPLAY_WIDTH),
                                 int(landmarks[8].y * DISPLAY_HEIGHT))
-                    thumb_tip = (DISPLAY_WIDTH - int(landmarks[4].x * DISPLAY_WIDTH), 
+                    thumb_tip = (DISPLAY_WIDTH - int(landmarks[4].x * DISPLAY_WIDTH),
                                 int(landmarks[4].y * DISPLAY_HEIGHT))
-                    
-                    # Visual connection between index and thumb
-                    if index_tip and thumb_tip:
-                        cv2.line(display_frame, index_tip, thumb_tip, (255, 0, 0), 2)
+                    palm_center = (DISPLAY_WIDTH - int(landmarks[0].x * DISPLAY_WIDTH),
+                                int(landmarks[0].y * DISPLAY_HEIGHT))
 
-            # Update preview cache if needed
-            if current_time - last_cache_update > cache_cooldown:
-                preview_cache = window_controller.get_windows()
-                last_cache_update = current_time
+            # Drive the dock/panel state machine (palm-open show/hide, dock
+            # icon hover+pinch selection, and whichever panel is active)
+            dock_manager.update(index_tip, thumb_tip, pinching, palm_open)
 
-            # Display cached window previews
-            preview_width = 120
-            preview_height = 80
-            margin = 10
+            if dock_manager.components_visible != is_topmost:
+                is_topmost = dock_manager.components_visible
+                set_topmost(hwnd, is_topmost)
 
-            def preview_rect(idx):
-                x = DISPLAY_WIDTH - preview_width - margin
-                y = margin + idx * (preview_height + margin)
-                return x, y
+            dock_manager.draw(display_frame, index_tip)
+            dock_manager.draw_countdown(display_frame, palm_center)
 
-            # Find which preview (if any) the finger is over. Done once, up
-            # front, against the list as it stood for this frame -- the
-            # activation decision below never re-checks this after the list
-            # may have re-sorted, which is what was causing the cascade.
-            hovered_index = None
+            # System-wide mouse control -- only engaged while the dock isn't
+            # showing, so the same pinch doesn't both pick a dock item and
+            # fire a real OS click at the same time.
+            mouse_controller.update(norm_x, norm_y, pinching, right_click_pinch,
+                                    scroll_pinch, active=not dock_manager.components_visible)
+
+            # VisionOS never renders your hand as a 3D model -- tracking is
+            # invisible and only the UI reacts. A small glow stands in for
+            # the (nonexistent) eye-tracking gaze point.
             if index_tip:
-                for i in range(len(preview_cache)):
-                    x, y = preview_rect(i)
-                    if x <= index_tip[0] <= x+preview_width and y <= index_tip[1] <= y+preview_height:
-                        hovered_index = i
-                        break
-
-            for i, win in enumerate(preview_cache):
-                x, y = preview_rect(i)
-
-                # Draw preview background
-                cv2.rectangle(display_frame, (x, y), (x+preview_width, y+preview_height),
-                             (50, 50, 50), -1)
-
-                # App icon thumbnail
-                icon_size = 32
-                icon = window_controller.get_icon(win._hWnd, icon_size)
-                icon_pos = (x + (preview_width - icon_size) // 2, y + 6)
-                blit_icon(display_frame, icon, icon_pos)
-
-                border_color = (0, 255, 0) if i == hovered_index else (255, 255, 255)
-                cv2.rectangle(display_frame, (x, y), (x+preview_width, y+preview_height),
-                             border_color, 2 if i == hovered_index else 1)
-
-                # Display window title
-                title = win.title[:15] + "..." if len(win.title) > 15 else win.title
-                cv2.putText(display_frame, title, (x+5, y+preview_height-8),
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.35, (255, 255, 255), 1)
-
-            # Activate only on a *fresh* hover -- the finger has to leave the
-            # preview area and come back before another switch can fire.
-            # This is what stops the list re-sorting (every cache_cooldown,
-            # once a window is activated it jumps to the front of the
-            # Z-order) from immediately triggering another switch on
-            # whatever window ends up back under a finger that never moved.
-            if (hovered_index is not None and not window_hover_active and
-                    not is_dragging and current_time - last_click_time > click_cooldown):
-                window_controller.activate_window(hovered_index)
-                last_click_time = current_time
-
-            window_hover_active = hovered_index is not None
-
-            # Volume control
-            bar_x, bar_y, bar_w, bar_h = volume_bar_rect
-            cv2.rectangle(display_frame, (bar_x, bar_y), (bar_x+bar_w, bar_y+bar_h), (50,50,50), -1)
-            filled = int((volume_level/100)*bar_w)
-            cv2.rectangle(display_frame, (bar_x, bar_y), (bar_x+filled, bar_y+bar_h), (0,200,0), -1)
-            cv2.rectangle(display_frame, (bar_x, bar_y), (bar_x+bar_w, bar_y+bar_h), (255,255,255), 2)
-            knob_x = bar_x + filled
-            cv2.circle(display_frame, (knob_x, bar_y+bar_h//2), 15, (0,0,255), -1)
-            cv2.putText(display_frame, f"{volume_level}%", (bar_x+bar_w+10, bar_y+bar_h), 
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255,255,255), 2)
-
-            if index_tip:
-                near_knob = (abs(index_tip[0]-knob_x) < 30 and abs(index_tip[1]-(bar_y+bar_h//2)) < 30)
-                near_bar_track = abs(index_tip[1]-(bar_y+bar_h//2)) < 30
-
-                if near_knob:
-                    is_dragging = True
-                elif not near_bar_track:
-                    # Finger has moved away from the slider track (e.g. toward a
-                    # window preview) -- release the drag so it doesn't keep
-                    # eating every subsequent finger movement.
-                    is_dragging = False
-
-                if is_dragging:
-                    vol = int(((index_tip[0]-bar_x)/bar_w)*100)
-                    vol = max(0, min(100, vol))
-                    if vol != volume_level:
-                        volume_controller.set_volume(vol)
-                        volume_level = vol
-
-            if not index_tip and is_dragging:
-                is_dragging = False
+                ui_theme.draw_focus_cursor(display_frame, index_tip, pinching=pinching)
 
             # Instructions
-            instructions = [
-                "Volume: Drag the red knob with index finger",
-                "Window Control:",
-                "  - Point at preview → Activate window",
-                "Press 'q' to quit"
-            ]
-            
+            if dock_manager.components_visible:
+                instructions = [
+                    "Hover a dock icon and pinch to switch panels",
+                    "Pinch the volume knob to grab and drag it",
+                    "Press 'q' to quit"
+                ]
+            else:
+                instructions = [
+                    "Mouse mode: point to move, thumb+index pinch to click/drag,",
+                    "thumb+middle to right-click, thumb+ring (hold) to scroll",
+                    "Open your palm to show the dock instead",
+                    "Press 'q' to quit"
+                ]
+
             for i, text in enumerate(instructions):
-                cv2.putText(display_frame, text, (20, DISPLAY_HEIGHT - 100 + i*20),
+                cv2.putText(display_frame, text, (20, DISPLAY_HEIGHT - 70 + i*20),
                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-            
+
             cv2.imshow('Gesture Control System', display_frame)
 
         except Exception as e:
